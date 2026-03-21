@@ -1,278 +1,8 @@
-(require 'gptel)
-(require 'subr-x)
-(require 'auth-source)
-(require 'json)
-
-;;; ------------------------------------------------------------------
-;;; Variables
-;;; ------------------------------------------------------------------
-
-(defvar gptel-dispvm--process nil)
-(defvar gptel-dispvm--ready nil)
-(defvar gptel-dispvm--redlib-process nil
-  "Process for the socat tunnel to Redlib.")
-(defvar gptel-dispvm--redlib-pid nil
-  "PID of the socat tunnel process we launched, for orphan verification.")
-(defvar gptel-dispvm--pending-callbacks nil
-  "Callbacks queued during async VM startup.")
-
-(defvar gptel-dispvm--exec-queue nil
-  "Queue of (FUNCTION . ARGS) for serialized command execution.")
-(defvar gptel-dispvm--exec-busy nil
-  "Non-nil when an async command is in progress.")
-
-
-(defcustom gptel-dispvm-timeout 30
-  "Timeout in seconds for dispVM commands."
-  :type 'integer
-  :group 'gptel)
-(put 'gptel-dispvm-timeout 'risky-local-variable t)
-
-(defcustom gptel-dispvm-search-engine 'duckduckgo
-  "Default search engine to use.
-Options are `kagi' (requires API token) or `duckduckgo' (no token needed)."
-  :type '(choice (const :tag "DuckDuckGo (no token)" duckduckgo)
-                 (const :tag "Kagi (requires token)" kagi))
-  :group 'gptel)
-(put 'gptel-dispvm-search-engine 'risky-local-variable t)
-
-(defcustom gptel-dispvm-ddg-search-delay 5.0
-  "Minimum seconds between DuckDuckGo searches to avoid rate limiting."
-  :type 'number
-  :group 'gptel)
-
-(defvar gptel-dispvm--ddg-last-search-time nil
-  "Timestamp of the last DuckDuckGo search, for rate-limit pacing.")
-
-(defcustom gptel-dispvm-ddg-retry-delay 10.0
-  "Seconds to wait before retrying a failed DuckDuckGo search."
-  :type 'number
-  :group 'gptel)
-
-(defcustom gptel-dispvm-vpn-vm "sys-vpn-mullvad-42"
-  "Name of the VPN VM for Mullvad reconnect on DDG rate limit."
-  :type 'string
-  :group 'gptel)
-(put 'gptel-dispvm-vpn-vm 'risky-local-variable t)
-
-(defcustom gptel-dispvm-vpn-countries '("no" "fi" "cz" "sk" "pl" "de" "fr" "it")
-  "Mullvad country codes for random relay selection on reconnect.
-A random country is chosen each time VPN reconnects to get a fresh IP."
-  :type '(repeat string)
-  :group 'gptel)
-(put 'gptel-dispvm-vpn-countries 'risky-local-variable t)
-
-(defcustom gptel-dispvm-vpn-reconnect-delay 5.0
-  "Seconds to wait after VPN reconnect before retrying DDG search.
-Must be long enough for WireGuard handshake and route propagation."
-  :type 'number
-  :group 'gptel)
-(put 'gptel-dispvm-vpn-reconnect-delay 'risky-local-variable t)
-
-(defcustom gptel-dispvm-fetch-max-chars 8000
-  "Maximum characters to extract from fetched web pages.
-Applies to both the Python content extractor and the w3m fallback."
-  :type 'integer
-  :group 'gptel)
-(put 'gptel-dispvm-fetch-max-chars 'risky-local-variable t)
-
-(defcustom gptel-dispvm-debug nil
-  "Enable debug messages for troubleshooting."
-  :type 'boolean
-  :group 'gptel)
-
-;;; ------------------------------------------------------------------
-;;; Sandbox mode variables
-;;; ------------------------------------------------------------------
-
-(defvar gptel-qubes-sandbox-active nil
-  "Non-nil when sandbox mode is active.
-All tool calls are routed to the dispvm instead of executing locally.")
-
-(declare-function gptel-agent--execute-bash "gptel-agent-tools")
-(declare-function gptel-agent--write-file "gptel-agent-tools")
-(declare-function gptel-agent--make-directory "gptel-agent-tools")
-(declare-function gptel-agent--edit-files "gptel-agent-tools")
-(declare-function gptel-agent--insert-in-file "gptel-agent-tools")
-(declare-function gptel-agent--read-file-lines "gptel-agent-tools")
-(declare-function gptel-agent--glob "gptel-agent-tools")
-(declare-function gptel-agent--grep "gptel-agent-tools")
-(declare-function gptel-agent--fix-patch-headers "gptel-agent-tools")
-
-(defcustom gptel-qubes-sandbox-output-dir "~/Downloads/gptel-sandbox/"
-  "Directory where sandbox tar.gz output files are saved."
-  :type 'directory
-  :group 'gptel)
-
-(defcustom gptel-qubes-sandbox-auto-confirm t
-  "When non-nil, skip confirmation overlays for sandbox tool calls.
-Safe because all operations happen in an isolated, ephemeral dispvm.
-When nil, sandbox tool calls still route to the dispvm but the
-confirmation preview overlay is shown first (the :around advice only
-intercepts after the caller's confirmation flow completes).
-NOTE: Currently the advice intercepts at the tool function level,
-which means the preview-setup functions in gptel-agent-tools.el
-still reference local paths. A future enhancement could advise the
-preview-setup functions to show dispvm paths instead."
-  :type 'boolean
-  :group 'gptel)
-
-(defcustom gptel-qubes-sandbox-max-transfer-size 10485760
-  "Maximum tar.gz size in bytes for transfer from dispvm (default 10MB)."
-  :type 'integer
-  :group 'gptel)
-
-(defcustom gptel-qubes-sandbox-working-dir "/home/user/project"
-  "Working directory inside the dispvm for sandbox development."
-  :type 'string
-  :group 'gptel)
-
-(defconst gptel-qubes-sandbox--log-buffer "*gptel-sandbox-log*"
-  "Buffer name for sandbox command/output logging.")
-
-(defun gptel-qubes-sandbox--log (type format-string &rest args)
-  "Log to sandbox log buffer. TYPE is CMD or OUT."
-  (let ((buf (get-buffer-create gptel-qubes-sandbox--log-buffer))
-        (timestamp (format-time-string "%Y-%m-%d %H:%M:%S")))
-    (with-current-buffer buf
-      (goto-char (point-max))
-      (insert (format "[%s] %s: %s\n" timestamp type
-                      (apply #'format format-string args))))))
-
-;;; ------------------------------------------------------------------
-;;; Sandbox execution
-;;; ------------------------------------------------------------------
-
-(defun gptel-qubes-sandbox--exec-sync (cmd &optional timeout)
-  "Execute CMD in sandbox dispvm synchronously, return output string.
-Sends the echo marker on a SEPARATE line (heredoc-safe), unlike
-`gptel-dispvm--exec' which appends on the same line.
-Calls `redisplay' during polling so Emacs UI remains responsive."
-  (unless (process-live-p gptel-dispvm--process)
-    (error "gptel-sandbox: No active dispvm connection"))
-  (gptel-qubes-sandbox--log "CMD" "%s" cmd)
-  (let* ((timeout (or timeout gptel-dispvm-timeout))
-         (marker (gptel-dispvm--make-marker))
-         (buf (process-buffer gptel-dispvm--process))
-         (max-iterations (* timeout 10)))
-    (with-current-buffer buf (erase-buffer))
-    ;; Send command with echo marker on its OWN line (heredoc-safe)
-    (process-send-string gptel-dispvm--process
-                         (concat cmd "\necho " marker "\n"))
-    (let ((waited 0))
-      (while (and (< waited max-iterations)
-                  (process-live-p gptel-dispvm--process)
-                  (not (with-current-buffer buf
-                         (string-match-p marker (buffer-string)))))
-        (accept-process-output gptel-dispvm--process 0.1)
-        (redisplay)
-        (setq waited (1+ waited))))
-    (with-current-buffer buf
-      (let ((content (buffer-string)))
-        (if (string-match-p marker content)
-            (let ((result (string-trim
-                           (replace-regexp-in-string
-                            (concat marker ".*") "" content))))
-              (gptel-qubes-sandbox--log "OUT" "%s"
-                                        (if (> (length result) 200)
-                                            (concat (substring result 0 200) "...")
-                                          result))
-              result)
-          (error "gptel-sandbox: Command timed out"))))))
-
-(defun gptel-qubes-sandbox--exec-async (cmd callback &optional timeout)
-  "Execute CMD in sandbox dispvm asynchronously, call CALLBACK with output.
-Logs command and output to the sandbox log buffer."
-  (gptel-qubes-sandbox--log "CMD" "%s" cmd)
-  (gptel-dispvm--exec-async
-   cmd
-   (lambda (result)
-     (gptel-qubes-sandbox--log "OUT" "%s"
-                               (if (and result (> (length result) 200))
-                                   (concat (substring result 0 200) "...")
-                                 (or result "(nil/timeout)")))
-     (funcall callback result))
-   timeout))
-
-;;; ------------------------------------------------------------------
-;;; Sandbox system prompt
-;;; ------------------------------------------------------------------
-
-(defvar gptel-qubes-sandbox--original-system-message nil
-  "Saved original system message before sandbox injection.")
-
-(defconst gptel-qubes-sandbox--system-prompt-addition
-  "
-
-You are developing inside an isolated Qubes OS disposable VM (dispvm).
-
-Environment:
-- All file operations (write, edit, mkdir, bash) execute inside the dispvm, not on the host.
-- The filesystem is ephemeral — it will be destroyed when the session ends.
-- You have root access. You can freely install packages with apt-get.
-- Internet access is available for downloading dependencies and documentation.
-- Your working directory is /home/user/project. Create all project files there.
-
-Workflow:
-- Install any needed tools/languages at the start (e.g., apt-get install -y nodejs npm).
-- Develop, test, and iterate freely — this environment is disposable.
-- When the implementation is complete and tested, structure your final output as:
-  /home/user/project/
-  ├── <application files>
-  ├── INSTALL.md (installation instructions for the target system)
-  └── README.md (usage instructions)
-- Tell the user when you're done so they can retrieve the packaged output."
-  "System prompt addition when sandbox mode is active.")
-
-(defun gptel-qubes-sandbox--inject-system-prompt ()
-  "Append sandbox context to the buffer-local gptel--system-message."
-  (setq gptel-qubes-sandbox--original-system-message gptel--system-message)
-  (setq gptel--system-message
-        (if (stringp gptel--system-message)
-            (concat gptel--system-message gptel-qubes-sandbox--system-prompt-addition)
-          gptel-qubes-sandbox--system-prompt-addition)))
-
-(defun gptel-qubes-sandbox--restore-system-prompt ()
-  "Restore the original gptel--system-message."
-  (when gptel-qubes-sandbox--original-system-message
-    (setq gptel--system-message gptel-qubes-sandbox--original-system-message)
-    (setq gptel-qubes-sandbox--original-system-message nil)))
-
-;;; ------------------------------------------------------------------
-;;; Sandbox tool advice
-;;; ------------------------------------------------------------------
-
-(defun gptel-qubes-sandbox--advise-mkdir (orig-fn parent name)
-  "Advice to route mkdir to sandbox dispvm.
-ORIG-FN is `gptel-agent--make-directory'. PARENT and NAME are directory args."
-  (if gptel-qubes-sandbox-active
-      (let* ((full-path (concat (file-name-as-directory parent) name))
-             (cmd (format "mkdir -p %s && echo 'Directory %s created/verified in %s'"
-                          (shell-quote-argument full-path)
-                          name parent)))
-        (gptel-qubes-sandbox--exec-sync cmd))
-    (funcall orig-fn parent name)))
-
-(defun gptel-qubes-sandbox--advise-glob (orig-fn pattern &optional path depth)
-  "Advice to route glob/tree to sandbox dispvm.
-ORIG-FN is `gptel-agent--glob'."
-  (if gptel-qubes-sandbox-active
-      (let* ((dir (or path gptel-qubes-sandbox-working-dir))
-             (depth-arg (if depth (format "-L %d" depth) ""))
-             (cmd (format "tree -f -i --noreport %s %s 2>/dev/null | grep -iE %s | head -100"
-                          depth-arg
-                          (shell-quote-argument dir)
-                          (shell-quote-argument pattern))))
-        (let ((result (gptel-qubes-sandbox--exec-sync cmd)))
-          (if (string-empty-p result)
-              (format "No files matching '%s' found in %s" pattern dir)
-            result)))
-    (funcall orig-fn pattern path depth)))
 
 (defun gptel-qubes-sandbox--advise-grep (orig-fn regex path &optional glob context-lines)
   "Advice to route grep to sandbox dispvm.
 ORIG-FN is `gptel-agent--grep'."
-  (if gptel-qubes-sandbox-active
+  (if (gptel-qubes-sandbox--ensure-active)
       (let* ((ctx (if (and context-lines (> context-lines 0))
                       (format "-C %d" (min context-lines 15))
                     ""))
@@ -285,15 +15,15 @@ ORIG-FN is `gptel-agent--grep'."
         (let ((result (gptel-qubes-sandbox--exec-sync cmd)))
           (if (string-empty-p result)
               (format "No matches for '%s' in %s" regex path)
-            result)))
-    (funcall orig-fn regex path glob context-lines)))
+            (gptel-qubes-sandbox--tag-dispvm-output result))))
+    (gptel-qubes-sandbox--refuse-local "grep")))
 
 (defun gptel-qubes-sandbox--advise-write (orig-fn path filename content)
   "Advice to route file writing to sandbox dispvm.
 ORIG-FN is `gptel-agent--write-file'. Uses dynamic heredoc marker."
-  (if gptel-qubes-sandbox-active
+  (if (gptel-qubes-sandbox--ensure-active)
       (let* ((full-path (concat (file-name-as-directory path) filename))
-             (marker (gptel-dispvm--make-marker))
+             (marker (gptel-qubes-sandbox--safe-marker content))
              (cmd (format "mkdir -p %s && cat > %s << '%s'\n%s\n%s"
                           (shell-quote-argument path)
                           (shell-quote-argument full-path)
@@ -302,33 +32,38 @@ ORIG-FN is `gptel-agent--write-file'. Uses dynamic heredoc marker."
                           marker)))
         (gptel-qubes-sandbox--exec-sync cmd)
         (format "Created file %s in %s" filename path))
-    (funcall orig-fn path filename content)))
+    (gptel-qubes-sandbox--refuse-local "write-file")))
 
 (defun gptel-qubes-sandbox--advise-read (orig-fn filename start-line end-line)
   "Advice to route file reading to sandbox dispvm.
 ORIG-FN is `gptel-agent--read-file-lines'."
-  (if gptel-qubes-sandbox-active
+  (if (gptel-qubes-sandbox--ensure-active)
       (let ((cmd (if (and start-line end-line)
-                     (format "sed -n '%d,%dp' %s"
+                     (format "sed -n '%d,%dp' %s 2>&1"
                              start-line end-line
                              (shell-quote-argument filename))
-                   (format "cat %s" (shell-quote-argument filename)))))
+                   (format "cat %s 2>&1" (shell-quote-argument filename)))))
         (let ((result (gptel-qubes-sandbox--exec-sync cmd)))
           (if (string-empty-p result)
               (format "Error: File %s is not readable or empty" filename)
-            result)))
-    (funcall orig-fn filename start-line end-line)))
+            (gptel-qubes-sandbox--tag-dispvm-output result))))
+    (gptel-qubes-sandbox--refuse-local "read-file")))
 
 (defun gptel-qubes-sandbox--advise-bash (orig-fn callback command)
   "Advice to route bash execution to sandbox dispvm.
-ORIG-FN is `gptel-agent--execute-bash'. CALLBACK receives output string."
-  (if gptel-qubes-sandbox-active
+ORIG-FN is `gptel-agent--execute-bash'. CALLBACK receives output string.
+Wraps command to capture stderr so the LLM sees error messages.
+Output is tagged as untrusted to defend against prompt injection
+from compromised dispvm processes."
+  (if (gptel-qubes-sandbox--ensure-active)
       (gptel-qubes-sandbox--exec-async
-       command
+       (concat "{ " command "\n} 2>&1")
        (lambda (output)
-         (funcall callback (or output "Command timed out")))
-       gptel-dispvm-timeout)
-    (funcall orig-fn callback command)))
+         (funcall callback
+                  (gptel-qubes-sandbox--tag-dispvm-output
+                   (or output "Command timed out"))))
+       gptel-dispvm-bash-timeout)
+    (gptel-qubes-sandbox--refuse-local "execute-bash")))
 
 (defconst gptel-qubes-sandbox--edit-python-script
   "import sys
@@ -355,8 +90,8 @@ Verifies exactly one occurrence before replacing.")
 ORIG-FN is `gptel-agent--edit-files'.
 String replacement mode uses Python for exact matching.
 Diff mode runs fix-patch-headers in Emacs, then patch in dispvm."
-  (if (not gptel-qubes-sandbox-active)
-      (funcall orig-fn path old-str new-str-or-diff diffp)
+  (if (not (gptel-qubes-sandbox--ensure-active))
+      (gptel-qubes-sandbox--refuse-local "edit-files")
     (if (and diffp (not (eq diffp :json-false)))
         ;; Diff/patch mode: fix headers in Emacs, then apply in dispvm
         (let* ((fixed-diff
@@ -372,31 +107,40 @@ Diff mode runs fix-patch-headers in Emacs, then patch in dispvm."
                   (goto-char (point-min))
                   (gptel-agent--fix-patch-headers)
                   (buffer-string)))
-               (marker (gptel-dispvm--make-marker))
-               (cmd (format "cat > /tmp/gptel_patch << '%s'\n%s\n%s\ncd %s && patch -p0 < /tmp/gptel_patch 2>&1; rm -f /tmp/gptel_patch"
-                            marker fixed-diff marker
-                            (shell-quote-argument (file-name-directory path)))))
-          (gptel-qubes-sandbox--exec-sync cmd))
-      ;; String replacement mode: use Python helper
-      (let* ((marker-old (gptel-dispvm--make-marker))
-             (marker-new (gptel-dispvm--make-marker))
+               (marker (gptel-qubes-sandbox--safe-marker fixed-diff))
+               ;; Use mktemp instead of hardcoded /tmp/gptel_patch
+               (cmd (concat
+                     "gptel_pf=$(mktemp) && "
+                     (format "cat > \"$gptel_pf\" << '%s'\n%s\n%s\n"
+                             marker fixed-diff marker)
+                     (format "cd %s && patch -p0 < \"$gptel_pf\" 2>&1; rm -f \"$gptel_pf\""
+                             (shell-quote-argument (file-name-directory path))))))
+          (gptel-qubes-sandbox--tag-dispvm-output
+           (gptel-qubes-sandbox--exec-sync cmd)))
+      ;; String replacement mode: use Python helper with mktemp
+      (let* ((marker-old (gptel-qubes-sandbox--safe-marker old-str))
+             (marker-new (gptel-qubes-sandbox--safe-marker new-str-or-diff))
              (cmd (concat
+                   ;; Create temp files with mktemp
+                   "gptel_of=$(mktemp) && gptel_nf=$(mktemp) && "
                    ;; Write old_str to temp file
-                   (format "cat > /tmp/gptel_old << '%s'\n%s\n%s\n"
+                   (format "cat > \"$gptel_of\" << '%s'\n%s\n%s\n"
                            marker-old old-str marker-old)
                    ;; Write new_str to temp file
-                   (format "cat > /tmp/gptel_new << '%s'\n%s\n%s\n"
+                   (format "cat > \"$gptel_nf\" << '%s'\n%s\n%s\n"
                            marker-new new-str-or-diff marker-new)
                    ;; Run Python helper
-                   (format "python3 -c %s %s /tmp/gptel_old /tmp/gptel_new; rm -f /tmp/gptel_old /tmp/gptel_new"
+                   (format "python3 -c %s %s \"$gptel_of\" \"$gptel_nf\"; rm -f \"$gptel_of\" \"$gptel_nf\""
                            (shell-quote-argument gptel-qubes-sandbox--edit-python-script)
                            (shell-quote-argument path)))))
-        (gptel-qubes-sandbox--exec-sync cmd)))))
+        (gptel-qubes-sandbox--tag-dispvm-output
+         (gptel-qubes-sandbox--exec-sync cmd))))))
 
 (defconst gptel-qubes-sandbox--insert-python-script
   "import sys
 path, lineno = sys.argv[1], int(sys.argv[2])
-with open('/tmp/gptel_insert_content') as f:
+content_file = sys.argv[3]
+with open(content_file) as f:
     new_text = f.read().rstrip('\\n')
 try:
     with open(path) as f:
@@ -415,26 +159,29 @@ with open(path, 'w') as f:
     f.writelines(lines)
 print('OK: inserted at line %d' % lineno)"
   "Python script for multi-line insert at line number in sandbox dispvm.
-Reads target file path and line number from sys.argv.
-Insert content read from /tmp/gptel_insert_content.
+Reads target file path and line number from sys.argv[1] and sys.argv[2].
+Insert content read from file at sys.argv[3] (mktemp path).
 Strips heredoc trailing newline, matches Elisp forward-line semantics.")
 
 (defun gptel-qubes-sandbox--advise-insert (orig-fn path line-number new-str)
   "Advice to route file insertion to sandbox dispvm.
 ORIG-FN is `gptel-agent--insert-in-file'. Uses Python for multi-line support."
-  (if gptel-qubes-sandbox-active
-      (let* ((marker (gptel-dispvm--make-marker))
+  (if (gptel-qubes-sandbox--ensure-active)
+      (let* ((marker (gptel-qubes-sandbox--safe-marker new-str))
              (cmd (concat
+                   ;; Create temp file with mktemp
+                   "gptel_cf=$(mktemp) && "
                    ;; Write content to temp file
-                   (format "cat > /tmp/gptel_insert_content << '%s'\n%s\n%s\n"
+                   (format "cat > \"$gptel_cf\" << '%s'\n%s\n%s\n"
                            marker new-str marker)
-                   ;; Run Python helper
-                   (format "python3 -c %s %s %d; rm -f /tmp/gptel_insert_content"
+                   ;; Run Python helper with temp file as argv[3]
+                   (format "python3 -c %s %s %d \"$gptel_cf\"; rm -f \"$gptel_cf\""
                            (shell-quote-argument gptel-qubes-sandbox--insert-python-script)
                            (shell-quote-argument path)
                            line-number))))
-        (gptel-qubes-sandbox--exec-sync cmd))
-    (funcall orig-fn path line-number new-str)))
+        (gptel-qubes-sandbox--tag-dispvm-output
+         (gptel-qubes-sandbox--exec-sync cmd)))
+    (gptel-qubes-sandbox--refuse-local "insert-in-file")))
 
 ;;; ------------------------------------------------------------------
 ;;; Sandbox mode lifecycle
@@ -447,17 +194,115 @@ ORIG-FN is `gptel-agent--insert-in-file'. Uses Python for multi-line support."
 
 (defun gptel-qubes-sandbox--around-sentinel (orig-fn proc event)
   "Advice on dispvm sentinel to handle unexpected death during sandbox.
-Calls teardown and notifies user."
+Calls teardown, sets died-unexpectedly flag, and notifies user.
+The died-unexpectedly flag prevents auto-reactivation — user must
+explicitly re-activate sandbox to clear it."
   (when gptel-qubes-sandbox-active
-    (message "gptel-sandbox: DispVM died unexpectedly — session lost")
+    (setq gptel-qubes-sandbox--dispvm-died-unexpectedly t)
+    (message "gptel-sandbox: DispVM died unexpectedly — session lost. %s"
+             "Tool calls BLOCKED until sandbox re-activated manually.")
     (setq gptel-qubes-sandbox-active nil)
-    (gptel-qubes-sandbox--remove-advice)
-    (gptel-qubes-sandbox--restore-system-prompt))
+    (setq gptel-qubes-sandbox--dispvm-name nil)
+    (gptel-qubes-sandbox--remove-lifecycle-advice)
+    ;; Restore tool confirmations
+    (when gptel-qubes-sandbox--saved-confirm-tool-calls
+      (setq gptel-confirm-tool-calls
+            (if (eq gptel-qubes-sandbox--saved-confirm-tool-calls 'gptel-qubes--was-nil)
+                nil
+              gptel-qubes-sandbox--saved-confirm-tool-calls))
+      (setq gptel-qubes-sandbox--saved-confirm-tool-calls nil))
+    (gptel-qubes-sandbox--update-indicator)
+    (force-mode-line-update t))
   (funcall orig-fn proc event))
 
-(defun gptel-qubes-sandbox--install-advice ()
-  "Install all sandbox advice functions."
-  ;; Tool advice
+(defun gptel-qubes-sandbox--filter-tool-calls (tool-calls)
+  "Filter TOOL-CALLS, returning (ALLOWED . BLOCKED-NAMES).
+ALLOWED is the list of tool-call entries whose tool name is in
+`gptel-qubes-sandbox--allowed-tools'.  BLOCKED-NAMES is a list
+of blocked tool name strings.  Blocked tools get an error result
+sent back to the LLM via their callback."
+  (let ((filtered nil)
+        (blocked nil))
+    (dolist (tc tool-calls)
+      (let* ((tool-spec (car tc))
+             (name (gptel-tool-name tool-spec)))
+        (if (member name gptel-qubes-sandbox--allowed-tools)
+            (push tc filtered)
+          (push name blocked)
+          ;; Return error to the LLM via process-tool-result callback
+          (let ((process-tool-result (nth 2 tc)))
+            (funcall process-tool-result
+                     (format "BLOCKED: Tool '%s' is not permitted — only sandboxed tools are allowed. Use Bash tool for execution, and file tools (Read/Write/Edit/Grep/Glob) for file operations." name))))))
+    (when blocked
+      (message "gptel-sandbox: BLOCKED tools: %s" (string-join blocked ", ")))
+    (cons (nreverse filtered) blocked)))
+
+(defun gptel-qubes-sandbox--gate-handle-tool-use (orig-fn fsm)
+  "Advice on `gptel--handle-tool-use' — the true chokepoint.
+This is where gptel dispatches ALL tool calls, including auto-confirmed
+ones that skip `gptel--display-tool-calls' and `gptel--accept-tool-calls'.
+Filters the :tool-use list in the FSM info to remove blocked tools
+BEFORE any execution happens."
+  (when-let* ((info (gptel-fsm-info fsm))
+              (tool-use (plist-get info :tool-use)))
+    (let ((blocked nil))
+      (dolist (tc tool-use)
+        (let ((name (plist-get tc :name)))
+          (unless (or (member name gptel-qubes-sandbox--allowed-tools)
+                      (plist-get tc :result)) ;already completed, skip
+            (push name blocked)
+            ;; Mark as completed with error result so gptel processes it
+            (plist-put tc :result
+                       (format "BLOCKED: Tool '%s' is not permitted — only sandboxed tools are allowed." name)))))
+      (when blocked
+        (message "gptel-sandbox: BLOCKED at handle-tool-use: %s"
+                 (string-join blocked ", ")))))
+  (funcall orig-fn fsm))
+
+(defun gptel-qubes-sandbox--gate-display-tool-calls (orig-fn tool-calls info &optional use-minibuffer)
+  "Advice on `gptel--display-tool-calls' — earliest interception point.
+Filters blocked tools BEFORE the confirmation UI is shown to the user.
+Without this, gptel shows a minibuffer prompt for blocked tools like Eval
+before our execution gate can block them."
+  (if (not tool-calls)
+      (funcall orig-fn tool-calls info use-minibuffer)
+    (pcase-let ((`(,allowed . ,_blocked) (gptel-qubes-sandbox--filter-tool-calls tool-calls)))
+      (if allowed
+          (funcall orig-fn allowed info use-minibuffer)
+        ;; All blocked — don't show confirmation UI, but don't orphan the FSM.
+        ;; Blocked tools already had process-tool-result called by filter-tool-calls.
+        nil))))
+
+(defun gptel-qubes-sandbox--gate-tool-calls (orig-fn &optional tool-calls ov)
+  "Advice on `gptel--accept-tool-calls' — defense-in-depth execution gate.
+Filters again at dispatch time in case tool calls bypass the display gate
+\(e.g. auto-confirmed tools, or direct calls to accept-tool-calls)."
+  (if (not tool-calls)
+      (funcall orig-fn tool-calls ov)
+    (pcase-let ((`(,allowed . ,_blocked) (gptel-qubes-sandbox--filter-tool-calls tool-calls)))
+      (if allowed
+          (funcall orig-fn allowed ov)
+        ;; All blocked — blocked tools already had their callbacks called.
+        nil))))
+
+(defun gptel-qubes-sandbox--install-tool-advice ()
+  "Install all sandbox security advice.
+These are always present when gptel-qubes is set up.
+
+Three security layers:
+Layer 1 — Tool advertisement: filter tools sent to the LLM
+Layer 2 — Tool execution gate: allowlist check at dispatch time
+Layer 3 — Tool routing: sandbox each allowed tool to the dispvm
+Plus: request-time system prompt injection (UX, not security)"
+  ;; Layer 1: Filter tools sent to the LLM (advertisement)
+  (advice-add 'gptel--parse-tools :around #'gptel-qubes-sandbox--advise-parse-tools)
+  ;; Layer 2: Gate at the TRUE dispatch chokepoint (handles auto-confirmed tools)
+  (advice-add 'gptel--handle-tool-use :around #'gptel-qubes-sandbox--gate-handle-tool-use)
+  ;; Layer 2a: Gate BEFORE confirmation UI (prevents user from seeing blocked tools)
+  (advice-add 'gptel--display-tool-calls :around #'gptel-qubes-sandbox--gate-display-tool-calls)
+  ;; Layer 2b: Gate at accept (defense-in-depth for manual confirmation path)
+  (advice-add 'gptel--accept-tool-calls :around #'gptel-qubes-sandbox--gate-tool-calls)
+  ;; Layer 3: Route each allowed tool to dispvm (sandbox routing)
   (advice-add 'gptel-agent--execute-bash :around #'gptel-qubes-sandbox--advise-bash)
   (advice-add 'gptel-agent--write-file :around #'gptel-qubes-sandbox--advise-write)
   (advice-add 'gptel-agent--make-directory :around #'gptel-qubes-sandbox--advise-mkdir)
@@ -466,56 +311,157 @@ Calls teardown and notifies user."
   (advice-add 'gptel-agent--read-file-lines :around #'gptel-qubes-sandbox--advise-read)
   (advice-add 'gptel-agent--glob :around #'gptel-qubes-sandbox--advise-glob)
   (advice-add 'gptel-agent--grep :around #'gptel-qubes-sandbox--advise-grep)
-  ;; Lifecycle advice
+  ;; System prompt: inject sandbox context at request time
+  (advice-add 'gptel--realize-query :around #'gptel-qubes-sandbox--advise-realize-query))
+
+(defun gptel-qubes-sandbox--install-lifecycle-advice ()
+  "Install lifecycle advice (response-complete suppression, sentinel).
+Only installed when sandbox is actively running."
   (advice-add 'gptel-dispvm--on-response-complete :around
               #'gptel-qubes-sandbox--suppress-response-complete)
   (advice-add 'gptel-dispvm--sentinel :around
               #'gptel-qubes-sandbox--around-sentinel))
 
-(defun gptel-qubes-sandbox--remove-advice ()
-  "Remove all sandbox advice functions."
-  (advice-remove 'gptel-agent--execute-bash #'gptel-qubes-sandbox--advise-bash)
-  (advice-remove 'gptel-agent--write-file #'gptel-qubes-sandbox--advise-write)
-  (advice-remove 'gptel-agent--make-directory #'gptel-qubes-sandbox--advise-mkdir)
-  (advice-remove 'gptel-agent--edit-files #'gptel-qubes-sandbox--advise-edit)
-  (advice-remove 'gptel-agent--insert-in-file #'gptel-qubes-sandbox--advise-insert)
-  (advice-remove 'gptel-agent--read-file-lines #'gptel-qubes-sandbox--advise-read)
-  (advice-remove 'gptel-agent--glob #'gptel-qubes-sandbox--advise-glob)
-  (advice-remove 'gptel-agent--grep #'gptel-qubes-sandbox--advise-grep)
+(defun gptel-qubes-sandbox--remove-lifecycle-advice ()
+  "Remove lifecycle advice."
   (advice-remove 'gptel-dispvm--on-response-complete
                  #'gptel-qubes-sandbox--suppress-response-complete)
   (advice-remove 'gptel-dispvm--sentinel
                  #'gptel-qubes-sandbox--around-sentinel))
 
 (defun gptel-qubes-sandbox--setup ()
-  "Activate sandbox mode: launch dispvm, install advice, create working dir."
-  (gptel-dispvm--start)
-  (gptel-qubes-sandbox--install-advice)
-  (gptel-qubes-sandbox--inject-system-prompt)
-  (setq gptel-qubes-sandbox-active t)
-  ;; Create working directory in dispvm
-  (gptel-qubes-sandbox--exec-sync
-   (format "mkdir -p %s" (shell-quote-argument gptel-qubes-sandbox-working-dir)))
-  (message "gptel-sandbox: Active (working dir: %s)" gptel-qubes-sandbox-working-dir))
+  "Activate sandbox mode: launch dispvm, install advice, create working dir.
+On error during setup, automatically tears down to prevent broken state.
+Clears the died-unexpectedly flag only after successful dispvm launch."
+  (condition-case err
+      (progn
+        (gptel-dispvm--start)
+        ;; Clear died flag only AFTER successful launch — if start fails,
+        ;; the flag stays set to prevent auto-reactivation retry loops
+        (setq gptel-qubes-sandbox--dispvm-died-unexpectedly nil)
+        (gptel-qubes-sandbox--install-lifecycle-advice)
+        ;; Set active BEFORE disabling confirmations (prevents race where
+        ;; confirmations are nil but sandbox-active is nil → local execution
+        ;; without confirmation)
+        (setq gptel-qubes-sandbox-active t)
+        ;; Disable tool call confirmations when auto-confirm is on
+        (when gptel-qubes-sandbox-auto-confirm
+          (setq gptel-qubes-sandbox--saved-confirm-tool-calls
+                (or gptel-confirm-tool-calls 'gptel-qubes--was-nil))
+          (setq gptel-confirm-tool-calls nil))
+        ;; Get dispvm name
+        (setq gptel-qubes-sandbox--dispvm-name
+              (gptel-qubes-sandbox--sanitize-hostname
+               (gptel-dispvm--exec "hostname" 5)))
+        ;; Create working directory in dispvm
+        (gptel-qubes-sandbox--exec-sync
+         (format "mkdir -p %s" (shell-quote-argument gptel-qubes-sandbox-working-dir)))
+        (message "gptel-sandbox: Active (working dir: %s)" gptel-qubes-sandbox-working-dir))
+    (error
+     (gptel-qubes-sandbox--teardown)
+     (signal (car err) (cdr err)))))
 
 (defun gptel-qubes-sandbox--teardown ()
-  "Deactivate sandbox mode: remove advice, restore prompt, destroy dispvm."
+  "Deactivate sandbox mode: remove advice, destroy dispvm.
+System prompt injection is request-time so nothing to restore."
   (setq gptel-qubes-sandbox-active nil)
-  (gptel-qubes-sandbox--remove-advice)
-  (gptel-qubes-sandbox--restore-system-prompt)
+  (setq gptel-qubes-sandbox--dispvm-name nil)
+  (gptel-qubes-sandbox--remove-lifecycle-advice)
+  ;; Restore tool call confirmations
+  (when gptel-qubes-sandbox--saved-confirm-tool-calls
+    (setq gptel-confirm-tool-calls
+          (if (eq gptel-qubes-sandbox--saved-confirm-tool-calls 'gptel-qubes--was-nil)
+              nil
+            gptel-qubes-sandbox--saved-confirm-tool-calls))
+    (setq gptel-qubes-sandbox--saved-confirm-tool-calls nil))
   (gptel-dispvm--stop)
+  (gptel-qubes-sandbox--update-indicator)
+  (force-mode-line-update t)
   (message "gptel-sandbox: Deactivated"))
 
+(defvar gptel-qubes-sandbox--indicator-keymap
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mode-line mouse-1] #'gptel-qubes-sandbox-mode)
+    (define-key map [mode-line mouse-3] #'gptel-qubes-sandbox-finalize)
+    map)
+  "Keymap for sandbox indicator.
+Mouse-1: toggle sandbox mode. Mouse-3: finalize (retrieve tar.gz).")
+
+(defvar gptel-qubes-sandbox--indicator-string nil
+  "Mode-line construct shown in `global-mode-string' for sandbox toggle.")
+(put 'gptel-qubes-sandbox--indicator-string 'risky-local-variable t)
+
+(defun gptel-qubes-sandbox--update-indicator ()
+  "Update the sandbox indicator to reflect current state."
+  (setq gptel-qubes-sandbox--indicator-string
+        (if gptel-qubes-sandbox-active
+            (let ((label (if gptel-qubes-sandbox--dispvm-name
+                             (format " [Sandbox:ON:%s]" gptel-qubes-sandbox--dispvm-name)
+                           " [Sandbox:ON]")))
+              `(:propertize ,label
+                face (:foreground "orange" :weight bold)
+                mouse-face mode-line-highlight
+                help-echo "Sandbox ON — click to deactivate\nmouse-3: finalize (retrieve tar.gz)"
+                keymap ,gptel-qubes-sandbox--indicator-keymap))
+          (if gptel-qubes-sandbox--dispvm-died-unexpectedly
+              `(:propertize " [Sandbox:DEAD]"
+                face (:foreground "red" :weight bold)
+                mouse-face mode-line-highlight
+                help-echo "DispVM died unexpectedly — tool calls BLOCKED.\nClick to re-activate sandbox."
+                keymap ,gptel-qubes-sandbox--indicator-keymap)
+            (if (and gptel-qubes-sandbox-auto-activate
+                     (not gptel-qubes-sandbox--manually-disabled))
+                `(:propertize " [Sandbox:AUTO]"
+                  face (:foreground "cyan" :weight normal)
+                  mouse-face mode-line-highlight
+                  help-echo "Sandbox AUTO — will activate on first tool call\nmouse-1: activate now"
+                  keymap ,gptel-qubes-sandbox--indicator-keymap)
+              `(:propertize " [Sandbox:OFF]"
+                face (:foreground "red" :weight bold)
+                mouse-face mode-line-highlight
+                help-echo "Sandbox OFF — tool calls BLOCKED. Click to activate."
+                keymap ,gptel-qubes-sandbox--indicator-keymap)))))
+  (force-mode-line-update t))
+
+(defun gptel-qubes-sandbox--install-indicator ()
+  "Install sandbox indicator into `global-mode-string' (persistent)."
+  (unless global-mode-string
+    (setq global-mode-string '("")))
+  (unless (memq 'gptel-qubes-sandbox--indicator-string global-mode-string)
+    (setq global-mode-string
+          (append global-mode-string
+                  '(gptel-qubes-sandbox--indicator-string))))
+  (gptel-qubes-sandbox--update-indicator))
+
 ;;;###autoload
-(defun gptel-qubes-sandbox-mode ()
+(defun gptel-qubes-sandbox--on-agent-start (&rest _args)
+  "Hook called after `gptel-agent' starts. Auto-activates sandbox.
+System prompt injection is handled at request time by the
+`gptel--realize-query' advice, so no buffer scanning needed here."
+  (unless gptel-qubes-sandbox-active
+    (gptel-qubes-sandbox-mode 1)))
+
+(defun gptel-qubes-sandbox-mode (&optional arg)
   "Toggle sandbox development mode.
-When active, all gptel-agent tool calls execute in a Qubes dispvm."
-  (interactive)
-  (if gptel-qubes-sandbox-active
-      (if (y-or-n-p "Retrieve work from sandbox before closing? ")
-          (gptel-qubes-sandbox-finalize)  ; finalize calls teardown
-        (gptel-qubes-sandbox--teardown))
-    (gptel-qubes-sandbox--setup)))
+When active, all gptel-agent tool calls execute in a Qubes dispvm.
+Click the mode-line indicator to toggle.
+With ARG, activate if positive, deactivate if negative or zero."
+  (interactive "P")
+  (let ((enable (if arg (> (prefix-numeric-value arg) 0)
+                  (not gptel-qubes-sandbox-active))))
+    (if enable
+        (progn
+          (setq gptel-qubes-sandbox--manually-disabled nil)
+          (gptel-qubes-sandbox--setup)
+          (gptel-qubes-sandbox--update-indicator)
+          (force-mode-line-update t))
+      (when gptel-qubes-sandbox-active
+        (setq gptel-qubes-sandbox--manually-disabled t)
+        (if (y-or-n-p "Retrieve work from sandbox before closing? ")
+            (gptel-qubes-sandbox-finalize)
+          (gptel-qubes-sandbox--teardown))
+        (gptel-qubes-sandbox--update-indicator)
+        (force-mode-line-update t)))))
 
 (defun gptel-qubes-sandbox--retrieve-tarball ()
   "Package sandbox working dir as tar.gz and transfer to Emacs AppVM.
@@ -539,7 +485,9 @@ Returns the output file path on success, nil on failure."
              (output-dir (expand-file-name gptel-qubes-sandbox-output-dir))
              (timestamp (format-time-string "%Y-%m-%d-%H%M%S"))
              (output-file (expand-file-name
-                           (format "sandbox-%s.tar.gz" timestamp)
+                           (format "sandbox-%s-%s.tar.gz"
+                                   (or gptel-qubes-sandbox--dispvm-name "unknown")
+                                   timestamp)
                            output-dir)))
         ;; Ensure output directory exists
         (make-directory output-dir t)
@@ -550,6 +498,8 @@ Returns the output file path on success, nil on failure."
           (let ((coding-system-for-write 'binary))
             (write-region (point-min) (point-max) output-file)))
         (message "gptel-sandbox: Output saved to %s (%d bytes)" output-file size)
+        (message "gptel-sandbox: SECURITY — Review before running. Extract safely with: mkdir out && tar -xzf %s -C out"
+                 output-file)
         output-file))))
 
 ;;;###autoload
@@ -620,7 +570,8 @@ Saves to `gptel-qubes-sandbox-output-dir' and destroys the dispvm."
         gptel-dispvm--ready nil
         gptel-dispvm--pending-callbacks nil
         gptel-dispvm--exec-queue nil
-        gptel-dispvm--exec-busy nil))
+        gptel-dispvm--exec-busy nil
+        gptel-dispvm--needs-drain nil))
 
 ;;; ------------------------------------------------------------------
 ;;; Start / Stop
@@ -690,7 +641,8 @@ Saves to `gptel-qubes-sandbox-output-dir' and destroys the dispvm."
   (setq gptel-dispvm--process nil
         gptel-dispvm--ready nil
         gptel-dispvm--exec-queue nil
-        gptel-dispvm--exec-busy nil))
+        gptel-dispvm--exec-busy nil
+        gptel-dispvm--needs-drain nil))
 
 (defun gptel-dispvm-force-stop ()
   "Force stop dispVM."
@@ -706,6 +658,9 @@ Saves to `gptel-qubes-sandbox-output-dir' and destroys the dispvm."
   "Execute CMD in dispVM with optional TIMEOUT."
   (unless (process-live-p gptel-dispvm--process)
     (error "gptel-dispvm: No active connection"))
+  ;; Drain shell if a previous command timed out
+  (when gptel-dispvm--needs-drain
+    (gptel-qubes-sandbox--drain-sync))
   (let* ((timeout (or timeout gptel-dispvm-timeout))
          (marker (gptel-dispvm--make-marker))
          (buf (process-buffer gptel-dispvm--process))
@@ -725,6 +680,7 @@ Saves to `gptel-qubes-sandbox-output-dir' and destroys the dispvm."
       (gptel-dispvm--debug "Exec wait iterations: %d/%d" waited max-iterations))
     (with-current-buffer buf
       (let ((content (buffer-string)))
+        (erase-buffer) ;; Clear immediately after extraction to prevent data lingering
         (if (string-match-p marker content)
             (string-trim
              (replace-regexp-in-string (concat marker ".*") "" content))
@@ -735,7 +691,11 @@ Saves to `gptel-qubes-sandbox-output-dir' and destroys the dispvm."
 ;;; ------------------------------------------------------------------
 
 (defun gptel-dispvm--clear-string (str)
-  "Securely clear string STR from memory."
+  "Securely clear string STR from memory.
+Uses `clear-string' on Emacs 29+ for proper byte-level clearing.
+Falls back to `fillarray' on older Emacs — works correctly for unibyte
+strings (API tokens are typically ASCII).  For full byte-level clearing
+on multibyte strings, Emacs 29+ is recommended."
   (when (stringp str)
     (if (fboundp 'clear-string)
         (clear-string str)
@@ -753,6 +713,9 @@ CALLBACK receives the command output string, or nil on timeout."
     (setq gptel-dispvm--exec-busy nil)
     (funcall callback nil))
    (t
+    ;; Drain shell if a previous command timed out
+    (when gptel-dispvm--needs-drain
+      (gptel-qubes-sandbox--drain-sync))
     (setq gptel-dispvm--exec-busy t)
     (let ((wrapped-cb (gptel-dispvm--wrap-callback-for-queue callback)))
       (let* ((timeout (or timeout gptel-dispvm-timeout))
@@ -760,7 +723,18 @@ CALLBACK receives the command output string, or nil on timeout."
              (buf (process-buffer gptel-dispvm--process))
              (proc gptel-dispvm--process)
              (completed nil)
-             (timer nil))
+             (timer nil)
+             ;; Idle timeout: reset timer on output activity so long-running
+             ;; commands (dnf install, compilation) don't time out while
+             ;; they're still producing progress output.
+             (timeout-fn
+              (lambda ()
+                (unless completed
+                  (setq completed t)
+                  (gptel-dispvm--debug "Async exec timed out (cmd length: %d)" (length cmd))
+                  (setq gptel-dispvm--needs-drain t)
+                  (set-process-filter proc #'gptel-dispvm--filter)
+                  (funcall wrapped-cb nil)))))
         (with-current-buffer buf (erase-buffer))
         ;; Install temporary process filter watching for marker
         (set-process-filter proc
@@ -769,6 +743,10 @@ CALLBACK receives the command output string, or nil on timeout."
               (with-current-buffer (process-buffer p)
                 (goto-char (point-max))
                 (insert output)
+                ;; Reset idle timeout — command is still producing output
+                (when (and (not completed) timer)
+                  (cancel-timer timer)
+                  (setq timer (run-at-time timeout nil timeout-fn)))
                 (when (and (not completed)
                            (save-excursion
                              (goto-char (point-min))
@@ -777,19 +755,13 @@ CALLBACK receives the command output string, or nil on timeout."
                   (set-process-filter p #'gptel-dispvm--filter)
                   (when timer (cancel-timer timer))
                   (let ((content (buffer-string)))
+                    (erase-buffer) ;; Clear after extraction
                     (funcall wrapped-cb
                              (string-trim
                               (replace-regexp-in-string
                                (concat marker ".*") "" content)))))))))
-        ;; Timeout timer
-        (setq timer
-              (run-at-time timeout nil
-                           (lambda ()
-                             (unless completed
-                               (setq completed t)
-                               (gptel-dispvm--debug "Async exec timed out (cmd length: %d)" (length cmd))
-                               (set-process-filter proc #'gptel-dispvm--filter)
-                               (funcall wrapped-cb nil)))))
+        ;; Initial idle timeout timer
+        (setq timer (run-at-time timeout nil timeout-fn))
         ;; Send command - echo marker on its own line so heredoc commands work
         (process-send-string proc (concat cmd "\necho " marker "\n")))))))
 
@@ -807,6 +779,9 @@ CALLBACK receives the command output string, or nil on timeout."
     (setq gptel-dispvm--exec-busy nil)
     (funcall callback nil))
    (t
+    ;; Drain shell if a previous command timed out
+    (when gptel-dispvm--needs-drain
+      (gptel-qubes-sandbox--drain-sync))
     (setq gptel-dispvm--exec-busy t)
     (let ((wrapped-cb (gptel-dispvm--wrap-callback-for-queue callback)))
       (let* ((timeout (or timeout gptel-dispvm-timeout))
@@ -815,7 +790,16 @@ CALLBACK receives the command output string, or nil on timeout."
              (buf (process-buffer gptel-dispvm--process))
              (proc gptel-dispvm--process)
              (completed nil)
-             (timer nil))
+             (timer nil)
+             ;; Idle timeout: reset on output activity
+             (timeout-fn
+              (lambda ()
+                (unless completed
+                  (setq completed t)
+                  (gptel-dispvm--debug "Async exec-stdin timed out (cmd length: %d)" (length cmd))
+                  (setq gptel-dispvm--needs-drain t)
+                  (set-process-filter proc #'gptel-dispvm--filter)
+                  (funcall wrapped-cb nil)))))
         (with-current-buffer buf (erase-buffer))
         ;; Send command — shell will echo GPTEL_STDIN_READY when ready for input
         (process-send-string
@@ -829,6 +813,10 @@ CALLBACK receives the command output string, or nil on timeout."
               (with-current-buffer (process-buffer p)
                 (goto-char (point-max))
                 (insert output)
+                ;; Reset idle timeout — activity detected
+                (when (and (not completed) timer)
+                  (cancel-timer timer)
+                  (setq timer (run-at-time timeout nil timeout-fn)))
                 (when (and (not completed)
                            (save-excursion
                              (goto-char (point-min))
@@ -852,6 +840,10 @@ CALLBACK receives the command output string, or nil on timeout."
                                 (with-current-buffer (process-buffer p2)
                                   (goto-char (point-max))
                                   (insert output2)
+                                  ;; Reset idle timeout — command still producing output
+                                  (when (and (not completed) timer)
+                                    (cancel-timer timer)
+                                    (setq timer (run-at-time timeout nil timeout-fn)))
                                   (when (and (not completed)
                                              (save-excursion
                                                (goto-char (point-min))
@@ -860,6 +852,7 @@ CALLBACK receives the command output string, or nil on timeout."
                                     (set-process-filter p2 #'gptel-dispvm--filter)
                                     (when timer (cancel-timer timer))
                                     (let ((content (buffer-string)))
+                                      (erase-buffer) ;; Clear after extraction
                                       (funcall wrapped-cb
                                                (string-trim
                                                 (replace-regexp-in-string
@@ -867,15 +860,9 @@ CALLBACK receives the command output string, or nil on timeout."
                       ;; Always clear secrets, even on error or dead process
                       (gptel-dispvm--clear-string stdin-data)
                       (gptel-dispvm--clear-string formatted))))))))
-        ;; Timeout timer
-        (setq timer
-              (run-at-time timeout nil
-                           (lambda ()
-                             (unless completed
-                               (setq completed t)
-                               (gptel-dispvm--debug "Async exec-stdin timed out (cmd length: %d)" (length cmd))
-                               (set-process-filter proc #'gptel-dispvm--filter)
-                               (funcall wrapped-cb nil))))))))))
+        ;; Initial idle timeout timer
+        (setq timer (run-at-time timeout nil timeout-fn)))))))
+
 
 ;;; ------------------------------------------------------------------
 ;;; Async launch
@@ -961,14 +948,15 @@ If VM needs launching, CALLBACK is queued and launch begins."
 ;;; ------------------------------------------------------------------
 
 (defun gptel-dispvm--get-kagi-token ()
-  "Get Kagi API token from authinfo (returns a copy for safe clearing)."
+  "Get Kagi API token from authinfo (returns a unibyte copy for safe clearing).
+Returns a unibyte string so `fillarray' on Emacs < 29 properly zeros all bytes."
   (let ((auth (auth-source-search :host "kagi.com" :max 1)))
     (when auth
       (let ((secret (plist-get (car auth) :secret)))
         (when-let ((val (if (functionp secret)
                             (funcall secret)
                           secret)))
-          (copy-sequence val))))))
+          (encode-coding-string val 'utf-8))))))
 
 (defun gptel-dispvm--parse-kagi-results (json-str)
   "Parse Kagi JSON response into list of (:url URL :excerpt TEXT)."
@@ -994,6 +982,7 @@ If VM needs launching, CALLBACK is queued and launch begins."
     (error
      (gptel-dispvm--debug "Kagi parse error: %s" (error-message-string err))
      (list (list :url "" :excerpt "Failed to parse Kagi response")))))
+
 (defun gptel-dispvm--exec-with-stdin (cmd stdin-data &optional timeout)
   "Execute CMD in dispVM, passing STDIN-DATA via stdin securely.
 Uses a handshake protocol: the shell prints GPTEL_STDIN_READY when
@@ -1050,6 +1039,7 @@ it is ready to receive stdin, eliminating the timing race."
       (gptel-dispvm--debug "Exec-stdin wait iterations: %d/%d" waited max-iterations))
     (with-current-buffer buf
       (let ((content (buffer-string)))
+        (erase-buffer) ;; Clear immediately after extraction to prevent data lingering
         (if (string-match-p marker content)
             (string-trim
              (replace-regexp-in-string (concat marker ".*") "" content))
@@ -1771,9 +1761,10 @@ Each option is individually shell-quoted to prevent injection."
 
 (defun gptel-dispvm--tag-web-content (text)
   "Wrap TEXT in untrusted-web-content tags for prompt injection defense.
-Sanitizes any occurrences of the tag itself within TEXT to prevent breakout."
+Sanitizes any occurrences of the tag itself within TEXT to prevent breakout.
+Uses \\s- (Emacs syntax class for whitespace) to catch whitespace-padded variants."
   (let ((sanitized (replace-regexp-in-string
-                    "</?\s*untrusted-web-content\s*>" "[filtered-tag]" text t)))
+                    "</?\\s-*untrusted-web-content\\s-*>" "[filtered-tag]" text t)))
     (format "<untrusted-web-content>\n%s\n</untrusted-web-content>" sanitized)))
 
 (defun gptel-dispvm--tag-search-results (results)
@@ -1787,6 +1778,17 @@ Only tags results with a non-empty :url (skips error/fallback entries)."
                                 (plist-get r :excerpt)))
               r))
           results))
+
+(defun gptel-qubes-sandbox--tag-dispvm-output (text)
+  "Wrap TEXT in untrusted-dispvm-output tags for prompt injection defense.
+Applied to all tool results returned from the sandbox dispvm.
+Sanitizes any occurrences of the tag itself within TEXT to prevent breakout.
+Uses \\s- (Emacs syntax class for whitespace) to catch whitespace-padded variants."
+  (if (and text (not (string-empty-p text)))
+      (let ((sanitized (replace-regexp-in-string
+                        "</?\\s-*untrusted-dispvm-output\\s-*>" "[filtered-tag]" text t)))
+        (format "<untrusted-dispvm-output>\n%s\n</untrusted-dispvm-output>" sanitized))
+    (or text "")))
 
 ;;; ------------------------------------------------------------------
 ;;; gptel-agent integration
@@ -1837,19 +1839,31 @@ Wraps web content in untrusted-web-content tags for prompt injection defense."
   (advice-add 'gptel-agent--read-url
               :around #'gptel-dispvm--around-read-url)
   (add-hook 'gptel-post-response-functions #'gptel-dispvm--on-response-complete)
+  ;; Install tool advice (always present for sandbox interception)
+  (gptel-qubes-sandbox--install-tool-advice)
+  ;; Install persistent sandbox toggle indicator in mode line
+  (gptel-qubes-sandbox--install-indicator)
+  ;; Always hook sandbox auto-start — tool calls are never allowed locally,
+  ;; so the sandbox must activate before any agent tool call executes
+  (advice-add 'gptel-agent :after #'gptel-qubes-sandbox--on-agent-start)
   (message "gptel-dispvm: Agent web operations now use dispVM (engine: %s)"
            gptel-dispvm-search-engine))
 
 (defun gptel-dispvm-restore-original ()
-  "Remove dispVM advice from gptel-agent."
+  "Remove dispVM web search advice from gptel-agent.
+Only removes the web search and URL fetching advice.
+Tool advice (bash, read, write, edit, etc.) is NEVER removed —
+it is the security boundary that prevents local execution."
   (interactive)
+  (when gptel-qubes-sandbox-active
+    (gptel-qubes-sandbox--teardown))
   (advice-remove 'gptel-agent--web-search-eww
                  #'gptel-dispvm--around-web-search)
   (advice-remove 'gptel-agent--read-url
                  #'gptel-dispvm--around-read-url)
   (remove-hook 'gptel-post-response-functions #'gptel-dispvm--on-response-complete)
   (gptel-dispvm--cleanup)
-  (message "gptel-dispvm: Restored original web functions"))
+  (message "gptel-dispvm: Web search advice removed. Tool sandbox enforcement remains active."))
 
 (provide 'gptel-qubes-dispvm)
 ;;; gptel-qubes-dispvm.el ends here
