@@ -29,7 +29,7 @@ Incorporates gptel-agent for web search via disposable VMs (dispvms).
 
 ### Sandbox Development Mode
 
-Enables the LLM agent to develop complete applications inside an isolated, ephemeral Qubes dispvm. All gptel-agent tool calls (write, edit, mkdir, bash, glob, grep, insert, read) are routed through the dispvm when sandbox mode is active. The agent can install packages, write code, run tests, and iterate — all inside the disposable VM. When done, the output is packaged as a tar.gz and transferred back to the Emacs AppVM.
+Enables the LLM agent to develop complete applications inside an isolated, ephemeral Qubes dispvm. The agent can never execute code, read files, or access data on the Emacs AppVM. All execution is confined to the disposable VM.
 
 **Usage:**
 1. `M-x gptel-qubes-sandbox-mode` — activate sandbox mode (launches dispvm)
@@ -43,7 +43,7 @@ Enables the LLM agent to develop complete applications inside an isolated, ephem
 - File edits use a Python helper for exact string matching (not regex) with uniqueness verification
 - File inserts use a Python helper for multi-line support matching Elisp semantics
 - Bash commands run asynchronously with callback handling
-- The system prompt is augmented to tell the LLM it's working inside a disposable VM
+- The system prompt is injected at request time (immune to preset switching)
 - The dispvm persists across agent turns (not destroyed per-response like websearch)
 - A `*gptel-sandbox-log*` buffer logs all commands and outputs for visibility
 
@@ -52,20 +52,59 @@ Enables the LLM agent to develop complete applications inside an isolated, ephem
 - `gptel-qubes-sandbox-working-dir` — working directory inside dispvm (default: `/home/user/project`)
 - `gptel-qubes-sandbox-max-transfer-size` — max tar.gz size for transfer (default: 10MB)
 - `gptel-qubes-sandbox-auto-confirm` — skip tool call confirmations in sandbox (default: t)
+- `gptel-qubes-sandbox-auto-activate` — auto-activate sandbox on agent start (default: t)
 
-**Security properties:**
-- All code executes in an ephemeral Qubes dispvm — destroyed when sandbox mode is deactivated
-- No access to the host AppVM filesystem or data
-- Heredoc delimiters use SHA-256 cryptographic markers — no collision with file content
-- All file paths are shell-quoted — no shell injection
-- Output is packaged as tar.gz and saved to disk — not auto-executed
-- If the dispvm dies unexpectedly, sandbox mode auto-deactivates and the user is notified
+### Security Architecture
+
+The sandbox enforces strict isolation through four independent layers. Each layer is unconditional once `gptel-dispvm-setup-agent` is called — no configuration can weaken them.
+
+**Layer 1 — Tool advertisement filtering** (`gptel--parse-tools` advice)
+
+Only tools on the allowlist are sent to the LLM. The LLM never sees Eval, Agent, Skill, or introspection tools — it cannot call what it does not know exists. This is an allowlist, not a blocklist: new tools added to gptel-agent are blocked by default.
+
+Allowed tools: `Bash`, `Write`, `Read`, `Edit`, `Insert`, `Mkdir`, `Glob`, `Grep`, `WebSearch`, `WebFetch`, `YouTube`, `TodoWrite`.
+
+**Layer 2 — Tool execution gates** (three interception points)
+
+Even if the LLM somehow calls a blocked tool (e.g., from conversation history), it is caught and blocked at every possible dispatch path in gptel:
+
+- `gptel--handle-tool-use` — the true chokepoint where ALL tool calls are dispatched, including auto-confirmed ones. Blocked tools are marked with an error result before any execution.
+- `gptel--display-tool-calls` — filters before the confirmation UI is shown to the user.
+- `gptel--accept-tool-calls` — defense-in-depth gate at manual dispatch.
+
+**Layer 3 — Tool routing enforcement** (8 individual `:around` advice functions)
+
+Every allowed tool (Bash, Read, Write, Edit, Insert, Mkdir, Glob, Grep) is individually intercepted and routed to the dispvm. If the sandbox is not active, execution is refused with a hard error — there is no fallback to local execution. The `(funcall orig-fn ...)` path has been completely eliminated from all tool advice functions.
+
+**Layer 4 — Qubes VM isolation**
+
+The dispvm is ephemeral, communicates only via qrexec pipes, and cannot initiate connections back to the AppVM. The dispvm filesystem is destroyed when the session ends.
+
+**Request-time system prompt injection** (`gptel--realize-query` advice)
+
+The sandbox context (Fedora/dnf, working directory, etc.) is appended to `gptel--system-message` in the prompt buffer right before every API request. This is immune to preset switching. Note: this is UX guidance only — the four layers above are the security boundary, not the prompt.
+
+**Security invariants:**
+- The agent can NEVER execute code on the Emacs AppVM
+- The agent can NEVER read files from the Emacs AppVM
+- The agent can NEVER access Emacs variables, functions, or runtime state
+- No `funcall orig-fn` exists in any tool advice function — local execution path is eliminated
+- All layers are unconditional — no flag or setting can disable them once installed
+- All layers use an allowlist — unknown/new tools are blocked by default
+- If the dispvm dies, the `[Sandbox:DEAD]` indicator appears and tool calls are blocked until manual re-activation
+
+**DispVM death handling:**
+- The sentinel sets `gptel-qubes-sandbox--dispvm-died-unexpectedly`
+- Auto-reactivation is suppressed to avoid masking systemic issues
+- User must explicitly re-activate via `M-x gptel-qubes-sandbox-mode`
+- Mode-line shows red `[Sandbox:DEAD]` for immediate visibility
 
 **Known limitations / risks:**
 - The dispvm has internet access — the LLM could download external code (but there's no sensitive data in a fresh dispvm)
-- The tar.gz output is not automatically reviewed — inspect before extracting and running
-- Tool result strings from the dispvm are not wrapped in `<untrusted-content>` tags (unlike websearch)
-- Setting `gptel-confirm-tool-calls` to nil for faster iteration means the LLM runs tools without human review
+- **Conversation context exfiltration:** The LLM has full access to the conversation context (including any code or secrets the user pastes) AND can execute bash with internet access in the dispvm. A prompt injection (via web search results or compromised dispvm output) could instruct the LLM to exfiltrate conversation content via `curl` or similar. **Mitigation:** Avoid pasting sensitive secrets (API keys, passwords) into conversations when using sandbox mode with internet-connected dispvms. Tool results are now wrapped in `<untrusted-dispvm-output>` tags to help the LLM distinguish trusted from untrusted content.
+- The tar.gz output is not automatically reviewed — extract into an empty directory (`mkdir out && tar -xzf file.tar.gz -C out`) and inspect before running
+- Tool result strings from the dispvm are wrapped in `<untrusted-dispvm-output>` tags (analogous to `<untrusted-web-content>` for web search) to defend against prompt injection from compromised dispvm processes
+- Agent definition files (`.md`/`.org`) with `:pre`/`:post` hooks execute elisp at load time — ensure agent files come from trusted sources
 
 ## Architecture
 
@@ -170,14 +209,22 @@ Enables the LLM agent to develop complete applications inside an isolated, ephem
 |  | +---------------------------+|              |     |
 |  | |  gptel-agent              ||              |     |
 |  | |                           |<--------------+     |
-|  | |  Tool calls intercepted   ||                    |
-|  | |  via :around advice:      ||                    |
-|  | |  - Write (heredoc+SHA256) ||                    |
-|  | |  - Edit  (Python helper)  ||                    |
-|  | |  - Insert(Python helper)  ||                    |
-|  | |  - Bash  (async callback) ||                    |
-|  | |  - Read  (cat/sed)        ||                    |
-|  | |  - Mkdir, Glob, Grep      ||                    |
+|  | |  SECURITY LAYERS:         ||                    |
+|  | |                           ||                    |
+|  | |  L1: parse-tools advice   ||                    |
+|  | |    LLM only sees allowed  ||                    |
+|  | |    tools (allowlist)      ||                    |
+|  | |           |               ||                    |
+|  | |  L2: handle-tool-use gate ||                    |
+|  | |    Blocks non-allowed at  ||                    |
+|  | |    true dispatch point    ||                    |
+|  | |    (incl. auto-confirmed) ||                    |
+|  | |           |               ||                    |
+|  | |  L3: :around advice on    ||                    |
+|  | |    each tool function     ||                    |
+|  | |    Routes to dispvm OR    ||                    |
+|  | |    hard error (no local   ||                    |
+|  | |    fallthrough exists)    ||                    |
 |  | +--+------------------------+|                    |
 |  |    |                         |                    |
 |  |    | qrexec (qubes.VMShell)  |                    |
@@ -191,7 +238,7 @@ Enables the LLM agent to develop complete applications inside an isolated, ephem
 |  | |  ├── INSTALL.md               |                 |
 |  | |  └── README.md                |                 |
 |  | |                               |                 |
-|  | | - apt-get install on the fly  |                 |
+|  | | - Fedora-based (dnf only)     |                 |
 |  | | - Full dev environment        |                 |
 |  | | - Internet for deps & docs    |                 |
 |  | | - Persists across agent turns |                 |
